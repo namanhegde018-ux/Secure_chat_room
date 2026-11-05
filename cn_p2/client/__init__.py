@@ -1,0 +1,1 @@
+"""Client-side integration adapters."""

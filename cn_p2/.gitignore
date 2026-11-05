@@ -1,0 +1,11 @@
+.venv/
+.tasktmp/
+.test-tmp/
+__pycache__/
+.pytest_cache/
+*.py[cod]
+*.tmp
+*.part
+identity.key
+trusted-peers.json
+received-*
