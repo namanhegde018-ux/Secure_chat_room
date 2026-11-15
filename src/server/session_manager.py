@@ -21,7 +21,10 @@ import time
 from dataclasses import dataclass
 from typing import Callable, Iterable, Optional
 
-import configuration as config
+try:  # Package execution
+    from . import configuration as config
+except ImportError:  # Direct execution from this directory
+    import configuration as config
 
 
 # --------------------------------------------------------------------------

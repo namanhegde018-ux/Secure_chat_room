@@ -12,7 +12,10 @@ import json
 import logging
 import struct
 
-import configuration as config
+try:  # Package execution
+    from . import configuration as config
+except ImportError:  # Direct execution from this directory
+    import configuration as config
 
 log = logging.getLogger("signaling.connection")
 

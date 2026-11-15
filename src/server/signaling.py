@@ -12,16 +12,18 @@ import logging
 import re
 from typing import Any
 
-import configuration as config
-from connection import Connection
-from session_manager import (
-    BadRequest,
-    Conflict,
-    NotFound,
-    NotRegistered,
-    SessionManager,
-    SignalingError,
-)
+try:  # Package execution
+    from . import configuration as config
+    from .connection import Connection
+    from .session_manager import (
+        BadRequest, Conflict, NotFound, NotRegistered, SessionManager, SignalingError,
+    )
+except ImportError:  # Direct execution from this directory
+    import configuration as config
+    from connection import Connection
+    from session_manager import (
+        BadRequest, Conflict, NotFound, NotRegistered, SessionManager, SignalingError,
+    )
 
 log = logging.getLogger("signaling")
 
