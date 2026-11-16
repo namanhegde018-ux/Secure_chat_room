@@ -5,7 +5,7 @@ import inspect
 import logging
 from typing import Any, Callable
 
-from .transport import (
+from transport import (
     DEFAULT_MAX_MESSAGE_SIZE,
     PeerClosed,
     TransportError,

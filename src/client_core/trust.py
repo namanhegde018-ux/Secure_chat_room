@@ -7,7 +7,7 @@ import os
 import threading
 from pathlib import Path
 
-from .crypto import CryptoError, fingerprint_of, normalize_fingerprint
+from crypto import CryptoError, fingerprint_of, normalize_fingerprint
 
 
 class PeerKeyChanged(CryptoError):

@@ -35,7 +35,7 @@ import hashlib
 
 from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey
 
-from .crypto import (
+from crypto import (
     KEY_LEN,
     SIGNATURE_LEN,
     CryptoError,
@@ -47,7 +47,7 @@ from .crypto import (
     raw_public_key,
     verify_signature,
 )
-from .trust import TrustStore
+from trust import TrustStore
 
 HANDSHAKE_KINDS = frozenset({"hs1", "hs2", "hs3"})
 
