@@ -25,8 +25,10 @@ import time
 from dataclasses import dataclass
 from typing import Callable, NamedTuple, Optional
 
-import configuration as config
-
+try:  # Package execution
+    from . import config
+except ImportError:  # Direct execution from this directory
+    import config
 
 class SignalingError(Exception):
     """Base class. The message is returned to the client that caused it."""

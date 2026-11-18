@@ -13,9 +13,9 @@ import logging
 import struct
 
 try:  # Package execution
-    from . import configuration as config
+    from . import config
 except ImportError:  # Direct execution from this directory
-    import configuration as config
+    import config
 
 log = logging.getLogger("signaling.connection")
 

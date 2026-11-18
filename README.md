@@ -15,3 +15,31 @@ See [`docs/GROUP_CHAT_INTEGRATION.md`](docs/GROUP_CHAT_INTEGRATION.md) for insta
 5. Open `http://127.0.0.1:5000/dashboard`.
 
 This is a controlled educational prototype. Keep the Flask control API on localhost and do not expose it to untrusted networks.
+
+
+
+PROJECT=/home/naman-hegde/Desktop/Programs/Computer_Networks/Secure_chat_room
+
+
+cd $PROJECT
+rm -f sdn/sdn_api.py src/client_core/demo_server.py
+cd sdn
+.venv-sdn/bin/pip install os-ken cryptography
+.venv-sdn/bin/python -c "import os_ken, mininet, cryptography; print('ok')"
+sudo mn -c
+
+cd $PROJECT/sdn
+.venv-sdn/bin/python run_controller.py
+
+cd $PROJECT/sdn
+sudo .venv-sdn/bin/python topology.py --clients 3
+
+mininet> xterm server h1 h2 h3
+
+export PY=/home/naman-hegde/Desktop/Programs/Computer_Networks/Secure_chat_room/sdn/.venv-sdn/bin/python
+cd /home/naman-hegde/Desktop/Programs/Computer_Networks/Secure_chat_room
+$PY main.py --server
+
+export PY=/home/naman-hegde/Desktop/Programs/Computer_Networks/Secure_chat_room/sdn/.venv-sdn/bin/python
+cd /home/naman-hegde/Desktop/Programs/Computer_Networks/Secure_chat_room
+$PY main.py --host 10.0.0.1

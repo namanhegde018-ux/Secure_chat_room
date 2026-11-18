@@ -1,64 +1,48 @@
-"""Mininet topology for the database-free secure group messenger lab.
+#!/usr/bin/env python3
+"""Mininet lab: one OVS switch, one server host, N anonymous client hosts.
 
-Deterministic switch ports:
-  1 Alice, 2 Bob, 3 Server, 4 Mallory, 5 Charlie, 6 David
+Run from sdn/: sudo .venv-sdn/bin/python topology.py --clients 3
 """
 
+import argparse
+
 from mininet.cli import CLI
-from mininet.log import setLogLevel, info
+from mininet.log import setLogLevel
 from mininet.net import Mininet
 from mininet.node import OVSSwitch, RemoteController
 from mininet.topo import Topo
 
-
-HOSTS = [
-    ("alice", "10.0.0.1/24", "00:00:00:00:00:01"),
-    ("bob", "10.0.0.2/24", "00:00:00:00:00:02"),
-    ("server", "10.0.0.3/24", "00:00:00:00:00:03"),
-    ("mallory", "10.0.0.4/24", "00:00:00:00:00:04"),
-    ("charlie", "10.0.0.5/24", "00:00:00:00:00:05"),
-    ("david", "10.0.0.6/24", "00:00:00:00:00:06"),
-]
+import lab_config as cfg
 
 
-class SecureGroupTopo(Topo):
-    def build(self):
-        switch = self.addSwitch(
-            "s1",
-            dpid="0000000000000001",
-            protocols="OpenFlow13",
-            failMode="secure",
-        )
-
-        # Link in this exact order. The order defines OVS port numbers.
-        for name, ip, mac in HOSTS:
-            host = self.addHost(name, ip=ip, mac=mac)
+class LabTopo(Topo):
+    def build(self, clients):
+        switch = self.addSwitch(cfg.BRIDGE, protocols="OpenFlow13", failMode="secure")
+        server = self.addHost(cfg.SERVER_NODE, ip=f"{cfg.SERVER_IP}/24")
+        self.addLink(server, switch)
+        for i in range(1, clients + 1):
+            host = self.addHost(cfg.client_node(i), ip=f"{cfg.client_ip(i)}/24")
             self.addLink(host, switch)
 
 
 def main():
+    parser = argparse.ArgumentParser(description="Secure messaging SDN lab")
+    parser.add_argument("--clients", type=int, default=cfg.DEFAULT_CLIENTS,
+                        help=f"number of client hosts (1..{cfg.MAX_CLIENTS})")
+    args = parser.parse_args()
+    if not 1 <= args.clients <= cfg.MAX_CLIENTS:
+        parser.error(f"--clients must be between 1 and {cfg.MAX_CLIENTS}")
+
     setLogLevel("info")
-    topo = SecureGroupTopo()
     net = Mininet(
-        topo=topo,
-        controller=None,
+        topo=LabTopo(clients=args.clients),
+        controller=RemoteController("c0", ip=cfg.OPENFLOW_HOST, port=cfg.OPENFLOW_PORT),
         switch=OVSSwitch,
-        autoSetMacs=False,
-        autoStaticArp=False,
+        autoSetMacs=True,
+        autoStaticArp=True,
     )
-
-    net.addController(
-        "c0",
-        controller=RemoteController,
-        ip="127.0.0.1",
-        port=6633,
-    )
-
+    net.start()
     try:
-        info("*** Starting secure group-chat topology\n")
-        net.start()
-        info("*** Host/port map: Alice=1, Bob=2, Server=3, Mallory=4, Charlie=5, David=6\n")
-        info("*** Group members: Alice, Bob, Charlie, David; Server is the relay; Mallory is monitored/blocked\n")
         CLI(net)
     finally:
         net.stop()

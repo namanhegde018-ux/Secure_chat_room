@@ -1,4 +1,17 @@
-# On Ubuntu, prefer the distro packages used in the lab:
-# sudo apt install mininet openvswitch-switch python3-os-ken python3-flask
-# This file is provided for reference; OS-Ken may be installed via apt.
-Flask>=3.1,<4
+
+# Python dependencies for main.py (tested with Python 3.12; your sdn/ pycache shows 3.14).
+# Install with:  pip install -r requirements.txt
+#
+#   server / client modes need only: cryptography (client), flask (server with SDN)
+#   controller mode needs:           os-ken
+#   topology mode needs:             Mininet (see below, NOT installable from this file)
+ 
+flask>=3.0            # sdn/sdn_api.py (SDN control API)
+cryptography>=42.0    # src/client_core (Ed25519, X25519, HKDF, ChaCha20-Poly1305)
+os-ken>=4.0           # sdn/sdn_controller.py (OpenFlow 1.3 controller)
+ 
+# --- System packages (not pip) ----------------------------------------------
+# Needed for `main.py topology` and for the server's ovs-ofctl / ovs-vsctl calls:
+#   sudo apt install mininet openvswitch-switch
+# Run topology/server with root (sudo) so they can talk to Open vSwitch.
+ 

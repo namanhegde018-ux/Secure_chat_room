@@ -11,16 +11,28 @@ import logging
 import re
 import time
 
-import configuration as config
-from session_manager import (
-    BadRequest,
-    Conflict,
-    InvalidState,
-    NotFound,
-    NotRegistered,
-    SessionManager,
-    SignalingError,
-)
+try:  # Package execution
+    from . import config
+    from .session_manager import (
+        BadRequest,
+        Conflict,
+        InvalidState,
+        NotFound,
+        NotRegistered,
+        SessionManager,
+        SignalingError,
+    )
+except ImportError:  # Direct execution from this directory
+    import config
+    from session_manager import (
+        BadRequest,
+        Conflict,
+        InvalidState,
+        NotFound,
+        NotRegistered,
+        SessionManager,
+        SignalingError,
+    )
 
 log = logging.getLogger("signaling")
 

@@ -1,7 +1,7 @@
 """
 Asyncio TCP server: accept loop, per-client read loop, and the background sweeper.
 
-Run with:   python -m server.server
+Run with:   python -m signaling_server.server
 """
 
 from __future__ import annotations
@@ -9,13 +9,13 @@ from __future__ import annotations
 import asyncio
 import logging
 
-try:  # Package execution: python -m server.server
-    from . import configuration as config
+try:  # Package execution: python -m signaling_server.server
+    from . import config
     from .connection import Connection, ConnectionClosed, FramingError, read_frame
     from .session_manager import SessionManager
     from .signaling import ClientRegistry, SignalingService
-except ImportError:  # Direct execution: python server/server.py
-    import configuration as config
+except ImportError:  # Direct execution: python signaling_server/server.py
+    import config
     from connection import Connection, ConnectionClosed, FramingError, read_frame
     from session_manager import SessionManager
     from signaling import ClientRegistry, SignalingService
