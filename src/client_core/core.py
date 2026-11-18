@@ -5,13 +5,14 @@ Public, UI-independent API for the messaging client.
 
 - Commands return concurrent.futures.Future and run on a private asyncio loop
   in a daemon thread. Frontends never touch the loop directly.
-- Events are emitted on the loop thread through EventEmitter, which dispatches
-  them to the UI (dispatch_to_ui) or queues them for drain_events().
-- Every application message and file body is sealed end to end. The server
-  relays ciphertext only.
-- Outgoing frames go through one asyncio.Queue drained by a single pump task.
-  Frames are sent in the order they were queued, so secure-channel sequence
-  numbers match wire order.
+- Events are emitted on the loop thread through EventEmitter.
+- Outgoing frames go through one asyncio.Queue drained by a single pump task,
+  so frames leave in the order they were queued.
+
+Groups: a session holds up to MAX_GROUP_SIZE members. Each pair of members runs
+its own handshake and secure channel, bound to the session id. A message is
+sealed separately for each other member and relayed by the server to that
+member only. Any failure in any pair fails the whole session.
 """
 from __future__ import annotations
 
@@ -21,7 +22,7 @@ import concurrent.futures
 import json
 import logging
 import threading
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Optional, Sequence, Union
 
 from crypto import CryptoError, Identity, fingerprint_of, safety_number
 from events import EventEmitter
@@ -34,8 +35,10 @@ from trust import PeerKeyChanged, TrustStore
 
 log = logging.getLogger(__name__)
 
-__all__ = ["ClientCore", "SecurityError"]
+__all__ = ["ClientCore", "SecurityError", "MAX_GROUP_SIZE"]
 
+MAX_GROUP_SIZE = 20             # must match the server's MAX_GROUP_SIZE
+FILE_SESSION_MAX_MEMBERS = 2    # file transfer is only available in two-person sessions
 HANDSHAKE_KINDS = frozenset({"hs1", "hs2", "hs3"})
 ROUTED_PREFIXES = ("file_", "export_")
 MAINTENANCE_INTERVAL = 5.0      # seconds between transfer sweeps and temp cleanup
@@ -47,7 +50,7 @@ class SecurityError(Exception):
 
 
 def _check_app_body(body: Any) -> None:
-    """Reject application bodies that would be interpreted as protocol messages."""
+    """Reject application bodies that would be read as protocol messages."""
     if not isinstance(body, dict):
         raise ValueError("message body must be a dict")
     kind = body.get("kind")
@@ -72,6 +75,7 @@ class ClientCore:
         "pong": "pong",
         "invitation": "invitation",
         "invite_sent": "invite_sent",
+        "invitation_accepted": "invitation_accepted",
         "invitation_rejected": "invitation_rejected",
         "invitation_cancelled": "invitation_cancelled",
         "invitation_expired": "invitation_expired",
@@ -115,7 +119,6 @@ class ClientCore:
             "heartbeat_timeout": heartbeat_timeout,
         }
 
-        # Identity: a new key is generated per run unless identity_path is given.
         self._identity = (
             Identity.load_or_create(identity_path) if identity_path else Identity.generate()
         )
@@ -124,7 +127,7 @@ class ClientCore:
         self._session = LocalSessionManager(client_id)
 
         self._temp = TempManager(client_id, root=temp_root)
-        self._temp.cleanup_stale_on_startup()                 # Scenario C
+        self._temp.cleanup_stale_on_startup()
 
         self._file_transfers = FileTransferManager(
             send_body=self._send_secure,
@@ -141,9 +144,12 @@ class ClientCore:
         self._pump_task: Optional[asyncio.Task] = None
         self._online = False
         self._closing = False
-        self._peers: dict[str, PeerSession] = {}
-        self._session_peer: dict[str, str] = {}
-        self._timers: dict[str, asyncio.TimerHandle] = {}
+        # session id -> sorted member names (including this client)
+        self._session_members: dict[str, tuple] = {}
+        # (session id, peer id) -> pairwise secure channel
+        self._peers: dict[tuple, PeerSession] = {}
+        # (session id, peer id) -> handshake timeout
+        self._timers: dict[tuple, asyncio.TimerHandle] = {}
 
         self._loop = asyncio.new_event_loop()
         self._thread = threading.Thread(
@@ -187,7 +193,6 @@ class ClientCore:
         return self._submit_coro(runner())
 
     def _call_sync(self, fn: Callable[..., Any], *args: Any) -> Any:
-        """Run fn on the loop and wait for the result. For short, read-mostly queries."""
         if threading.current_thread() is self._thread:
             return fn(*args)
         return self._submit(fn, *args).result(timeout=CALL_TIMEOUT)
@@ -208,8 +213,10 @@ class ClientCore:
         self._closing = True
         return asyncio.run_coroutine_threadsafe(self._shutdown(), self._loop)
 
-    def invite(self, to: str) -> concurrent.futures.Future:
-        return self._submit(self._invite, to)
+    def invite(self, to: Union[str, Sequence[str]]) -> concurrent.futures.Future:
+        """Invite one or more people to a new group. Every invitee must accept."""
+        targets = [to] if isinstance(to, str) else list(to)
+        return self._submit(self._invite, targets)
 
     def accept_invitation(self, invitation_id: str) -> concurrent.futures.Future:
         return self._submit(self._control, {"type": "accept", "invitation_id": invitation_id})
@@ -244,20 +251,16 @@ class ClientCore:
         self._events.off(event, callback)
 
     def drain_events(self, limit: Optional[int] = None):
-        """Call from the UI thread when dispatch_to_ui is not supplied."""
         return self._events.drain(limit)
 
     def join(self, timeout: Optional[float] = None) -> bool:
-        """Wait for the background thread to exit. Returns True if it has stopped."""
         self._thread.join(timeout)
         return not self._thread.is_alive()
 
     def verify_peer(self, peer_id: str, fingerprint: str) -> bool:
-        """Record that the user compared fingerprints out of band and they match."""
         return self._call_sync(self._verify_peer, peer_id, fingerprint)
 
     def forget_peer_key(self, peer_id: str) -> bool:
-        """Remove the pinned key for a peer. The next handshake pins a new key."""
         return self._call_sync(self._forget_peer_key, peer_id)
 
     def peer_status(self, session_id: Optional[str] = None) -> Optional[dict]:
@@ -329,7 +332,7 @@ class ClientCore:
             self._pump_task.cancel()
             self._pump_task = None
         self._outbox = None
-        for sid in list(self._peers):
+        for sid in list(self._session_members):
             self._drop_session(sid, reason)
         self._emit_session_state(self._session.clear())
         if self._online:
@@ -348,7 +351,6 @@ class ClientCore:
         self._pump_task = self._loop.create_task(self._pump_outbox(network, self._outbox))
 
     async def _pump_outbox(self, network: NetworkManager, outbox: asyncio.Queue) -> None:
-        """Send queued frames one at a time, in the order they were queued."""
         while True:
             message = await outbox.get()
             try:
@@ -374,12 +376,25 @@ class ClientCore:
 
     # ===================================================== invitations ==
 
-    def _invite(self, to: str) -> None:
-        if not isinstance(to, str) or not to or to == self.client_id:
-            raise ValueError("invalid recipient")
-        self._control({"type": "invite", "to": to})
+    def _invite(self, targets: list) -> None:
+        if not targets or not all(isinstance(t, str) and t for t in targets):
+            raise ValueError("invite needs at least one recipient name")
+        if len(set(targets)) != len(targets):
+            raise ValueError("duplicate recipient")
+        if self.client_id in targets:
+            raise ValueError("you cannot invite yourself")
+        if len(targets) + 1 > MAX_GROUP_SIZE:
+            raise ValueError(f"a group holds at most {MAX_GROUP_SIZE} members")
+        self._control({"type": "invite", "to": list(targets)})
 
     # ============================================================ sessions ==
+
+    def _others(self, sid: str) -> list:
+        return [m for m in self._session_members.get(sid, ()) if m != self.client_id]
+
+    def _pair_established(self, sid: str, peer: str) -> bool:
+        ps = self._peers.get((sid, peer))
+        return ps is not None and ps.established
 
     def _active_session_id(self, session_id: Optional[str] = None) -> str:
         sid = session_id if session_id is not None else self._session.current_session_id
@@ -387,15 +402,16 @@ class ClientCore:
             raise SecurityError("no active session")
         return sid
 
-    def _usable_session(self, session_id: Optional[str] = None) -> tuple[str, str]:
+    def _usable_session(self, session_id: Optional[str] = None) -> tuple:
+        """Return (session id, other members). Every pair must be established and verified."""
         sid = self._active_session_id(session_id)
-        ps = self._peers.get(sid)
-        if ps is None or not ps.established:
-            raise SecurityError("secure channel is not established for this session")
-        peer = self._session_peer[sid]
-        if self.require_verified_peers and not self._trust.is_verified(peer):
-            raise SecurityError(f"peer '{peer}' has not been verified; compare fingerprints first")
-        return sid, peer
+        peers = self._others(sid)
+        for peer in peers:
+            if not self._pair_established(sid, peer):
+                raise SecurityError(f"secure channel to '{peer}' is not established yet")
+            if self.require_verified_peers and not self._trust.is_verified(peer):
+                raise SecurityError(f"peer '{peer}' has not been verified; compare fingerprints first")
+        return sid, peers
 
     def _end_session(self, session_id: Optional[str]) -> None:
         sid = self._active_session_id(session_id)
@@ -404,15 +420,21 @@ class ClientCore:
     def _on_session_started(self, msg: dict) -> None:
         sid = msg.get("session_id")
         members = msg.get("members")
-        others = [m for m in members if m != self.client_id] if isinstance(members, list) else []
-        if not isinstance(sid, str) or len(others) != 1 or not isinstance(others[0], str):
+        valid = (
+            isinstance(sid, str)
+            and isinstance(members, list)
+            and all(isinstance(m, str) and m for m in members)
+            and self.client_id in members
+            and 2 <= len(members) <= MAX_GROUP_SIZE
+        )
+        if not valid:
             self._events.emit("error", {"request": "session_started", "message": "malformed session_started"})
             return
-        if sid in self._peers:
+        if sid in self._session_members:
             log.warning("duplicate session_started for %s", sid)
             return
 
-        peer = others[0]
+        others = sorted(m for m in members if m != self.client_id)
         try:
             self._temp.open_session(sid)
         except Exception as exc:
@@ -420,18 +442,24 @@ class ClientCore:
             return
 
         self._emit_session_state(self._session.apply_server_event(msg))
-        self._session_peer[sid] = peer
-        self._peers[sid] = PeerSession(sid, self.client_id, peer, self._identity, self._trust)
-        self._events.emit("session_started", {"session_id": sid, "members": members, "peer": peer})
-        self._timers[sid] = self._loop.call_later(self.handshake_timeout, self._on_handshake_timeout, sid)
+        self._session_members[sid] = tuple(sorted(members))
+        self._events.emit("session_started", {"session_id": sid, "members": members, "peers": others})
 
-        # Smaller client id initiates the handshake.
-        if self.client_id < peer:
-            try:
-                self._send_handshake(sid, self._peers[sid].start())
-            except Exception as exc:
-                log.exception("could not start handshake")
-                self._handshake_failed(sid, f"could not start handshake: {exc}")
+        for peer in others:
+            self._peers[(sid, peer)] = PeerSession(sid, self.client_id, peer, self._identity, self._trust)
+            self._timers[(sid, peer)] = self._loop.call_later(
+                self.handshake_timeout, self._on_handshake_timeout, sid, peer
+            )
+
+        # For each pair, the smaller client id initiates the handshake.
+        for peer in others:
+            if self.client_id < peer:
+                try:
+                    self._send_handshake(sid, peer, self._peers[(sid, peer)].start())
+                except Exception as exc:
+                    log.exception("could not start handshake")
+                    self._handshake_failed(sid, peer, f"could not start handshake: {exc}")
+                    return
 
     def _on_session_closed(self, msg: dict, event: str) -> None:
         sid = msg.get("session_id")
@@ -444,13 +472,15 @@ class ClientCore:
 
     def _drop_session(self, sid: str, reason: str) -> None:
         """Remove all local state for a session. Idempotent."""
-        self._cancel_timer(sid)
-        self._peers.pop(sid, None)
-        self._session_peer.pop(sid, None)
-        self._file_transfers.close_session(sid, reason)      # Scenarios A and B
+        for key in [k for k in self._timers if k[0] == sid]:
+            self._cancel_timer(key)
+        for key in [k for k in self._peers if k[0] == sid]:
+            del self._peers[key]
+        self._session_members.pop(sid, None)
+        self._file_transfers.close_session(sid, reason)
 
     def _fail_session(self, sid: str, reason: str) -> None:
-        """Local failure: drop the session and ask the server to end it for both sides."""
+        """Local failure in any pair: drop the group and ask the server to end it for everyone."""
         self._drop_session(sid, reason)
         try:
             self._enqueue({"type": "end_session", "session_id": sid})
@@ -464,28 +494,27 @@ class ClientCore:
 
     # ============================================================ handshake ==
 
-    def _send_handshake(self, sid: str, body: Optional[dict]) -> None:
+    def _send_handshake(self, sid: str, peer: str, body: Optional[dict]) -> None:
         if body is not None:
-            self._enqueue({"type": "message", "session_id": sid, "body": body})
+            self._enqueue({"type": "message", "session_id": sid, "to": peer, "body": body})
 
-    def _handle_handshake(self, sid: str, ps: PeerSession, body: dict) -> None:
+    def _handle_handshake(self, sid: str, peer: str, ps: PeerSession, body: dict) -> None:
         was_established = ps.established
         try:
             reply = ps.handle(body)
-            self._send_handshake(sid, reply)
+            self._send_handshake(sid, peer, reply)
         except PeerKeyChanged as exc:
             return self._on_key_changed(sid, exc)
         except CryptoError as exc:
-            return self._handshake_failed(sid, str(exc))
+            return self._handshake_failed(sid, peer, str(exc))
         except Exception:
             log.exception("unexpected handshake error")
-            return self._handshake_failed(sid, "internal error")
+            return self._handshake_failed(sid, peer, "internal error")
         if ps.established and not was_established:
-            self._on_established(sid, ps)
+            self._on_established(sid, peer, ps)
 
-    def _on_established(self, sid: str, ps: PeerSession) -> None:
-        self._cancel_timer(sid)
-        peer = self._session_peer[sid]
+    def _on_established(self, sid: str, peer: str, ps: PeerSession) -> None:
+        self._cancel_timer((sid, peer))
         self._events.emit("secure_session_established", {
             "session_id": sid,
             "peer": peer,
@@ -494,6 +523,11 @@ class ClientCore:
             "safety_number": safety_number(self._identity.public_key, ps.peer_identity_key),
             "verified": self._trust.is_verified(peer),
         })
+        if all(self._pair_established(sid, p) for p in self._others(sid)):
+            self._events.emit("session_ready", {
+                "session_id": sid,
+                "members": list(self._session_members.get(sid, ())),
+            })
 
     def _on_key_changed(self, sid: str, exc: PeerKeyChanged) -> None:
         self._events.emit("peer_key_changed", {
@@ -505,86 +539,95 @@ class ClientCore:
         })
         self._fail_session(sid, "peer key changed")
 
-    def _handshake_failed(self, sid: str, reason: str) -> None:
-        self._events.emit("handshake_failed", {
-            "session_id": sid, "peer": self._session_peer.get(sid), "reason": reason,
-        })
+    def _handshake_failed(self, sid: str, peer: str, reason: str) -> None:
+        self._events.emit("handshake_failed", {"session_id": sid, "peer": peer, "reason": reason})
         self._fail_session(sid, "handshake failed")
 
-    def _on_handshake_timeout(self, sid: str) -> None:
-        self._timers.pop(sid, None)
-        ps = self._peers.get(sid)
+    def _on_handshake_timeout(self, sid: str, peer: str) -> None:
+        self._timers.pop((sid, peer), None)
+        ps = self._peers.get((sid, peer))
         if ps is None or ps.established:
             return
-        self._handshake_failed(sid, "handshake timed out")
+        self._handshake_failed(sid, peer, "handshake timed out")
 
-    def _cancel_timer(self, sid: str) -> None:
-        timer = self._timers.pop(sid, None)
+    def _cancel_timer(self, key: tuple) -> None:
+        timer = self._timers.pop(key, None)
         if timer is not None:
             timer.cancel()
 
     # ================================================ encrypted messaging ==
 
     def _send_secure(self, session_id: str, body: dict) -> None:
-        """Seal one body for the session and queue it. Raises on failure."""
-        ps = self._peers.get(session_id)
-        if ps is None or not ps.established:
-            raise SecurityError("secure channel is not established for this session")
-        envelope = ps.channel.seal(body)          # returns {"kind": "secure", "seq", "ct"}
-        self._enqueue({"type": "message", "session_id": session_id, "body": envelope})
+        """Seal one body for every other member and queue it. Raises on failure."""
+        self._net()                                   # check before any sequence number is used
+        peers = self._others(session_id)
+        if not peers:
+            raise SecurityError("no active session")
+        for peer in peers:
+            if not self._pair_established(session_id, peer):
+                raise SecurityError(f"secure channel to '{peer}' is not established")
+        for peer in peers:
+            envelope = self._peers[(session_id, peer)].channel.seal(body)
+            self._enqueue({"type": "message", "session_id": session_id, "to": peer, "body": envelope})
 
     def _send_message(self, body: dict, session_id: Optional[str]) -> None:
         _check_app_body(body)
-        sid, _peer = self._usable_session(session_id)
+        sid, _peers = self._usable_session(session_id)
         self._send_secure(sid, body)
 
     async def _send_file(self, path: str, session_id: Optional[str]) -> str:
         self._net()
-        sid, peer = self._usable_session(session_id)
-        return await self._file_transfers.send_file(path, sid, peer)
+        sid, peers = self._usable_session(session_id)
+        if len(peers) + 1 > FILE_SESSION_MAX_MEMBERS:
+            raise SecurityError("File Transfer is Not available in Group chat")
+        return await self._file_transfers.send_file(path, sid, peers[0])
 
     @staticmethod
     def _open_secure(ps: PeerSession, body: dict) -> dict:
         return ps.channel.unseal(body)            # raises CryptoError on bad input
 
-    def _reject(self, sid: Optional[str], reason: str) -> None:
-        self._events.emit("message_rejected", {"session_id": sid, "reason": reason})
+    def _reject(self, sid: Optional[str], reason: str, sender: Optional[str] = None) -> None:
+        self._events.emit("message_rejected", {"session_id": sid, "from": sender, "reason": reason})
 
     def _on_relay(self, msg: dict) -> None:
         sid = msg.get("session_id")
         sender = msg.get("from")
         body = msg.get("body")
-        ps = self._peers.get(sid) if isinstance(sid, str) else None
+        if not isinstance(sid, str) or sid not in self._session_members:
+            return self._reject(sid, "no active session", sender)
+        if not isinstance(sender, str) or sender not in self._others(sid):
+            return self._reject(sid, "message from non-member", sender)
+        ps = self._peers.get((sid, sender))
         if ps is None:
-            return self._reject(sid, "no active secure session")
-        if sender != self._session_peer[sid]:
-            return self._reject(sid, "message from unexpected sender")
+            return self._reject(sid, "no secure channel to sender", sender)
         if not isinstance(body, dict):
-            return self._reject(sid, "malformed message")
+            return self._reject(sid, "malformed message", sender)
 
         kind = body.get("kind")
         if isinstance(kind, str) and kind in HANDSHAKE_KINDS:
-            return self._handle_handshake(sid, ps, body)
+            return self._handle_handshake(sid, sender, ps, body)
         if kind != "secure":
-            return self._reject(sid, "unencrypted message refused")
+            return self._reject(sid, "unencrypted message refused", sender)
         if not ps.established:
-            return self._reject(sid, "secure channel is not established")
+            return self._reject(sid, "secure channel is not established", sender)
         if self.require_verified_peers and not self._trust.is_verified(sender):
-            return self._reject(sid, "peer is not verified")
+            return self._reject(sid, "peer is not verified", sender)
         try:
             inner = self._open_secure(ps, body)
         except (CryptoError, ValueError):
-            return self._reject(sid, "authentication failed")
+            return self._reject(sid, "authentication failed", sender)
         self._route_inner(sid, sender, inner)
 
     def _route_inner(self, sid: str, sender: str, inner: dict) -> None:
         kind = inner.get("kind")
         if isinstance(kind, str) and kind.startswith(ROUTED_PREFIXES):
+            if len(self._session_members.get(sid, ())) > FILE_SESSION_MAX_MEMBERS:
+                return self._reject(sid, "file transfer is only available in two-person sessions", sender)
             if not self._file_transfers.handle_relay(sid, sender, inner):
-                self._reject(sid, "unknown file message")
+                self._reject(sid, "unknown file message", sender)
             return
         if isinstance(kind, str) and (kind in HANDSHAKE_KINDS or kind == "secure"):
-            return self._reject(sid, "nested protocol message refused")
+            return self._reject(sid, "nested protocol message refused", sender)
         self._events.emit("message", {"session_id": sid, "from": sender, "body": inner})
 
     # ================================================================ peers ==
@@ -606,19 +649,24 @@ class ClientCore:
             sid = self._active_session_id(session_id)
         except SecurityError:
             return None
-        ps = self._peers.get(sid)
-        if ps is None:
-            return None
-        peer = self._session_peer[sid]
-        peer_key = ps.peer_identity_key
+        peers = []
+        for peer in self._others(sid):
+            ps = self._peers.get((sid, peer))
+            key = ps.peer_identity_key if ps is not None else None
+            peers.append({
+                "peer": peer,
+                "state": ps.state.name if ps is not None else "MISSING",
+                "established": ps is not None and ps.established,
+                "verified": self._trust.is_verified(peer),
+                "peer_fingerprint": fingerprint_of(key) if key else None,
+            })
         return {
             "session_id": sid,
-            "peer": peer,
-            "state": ps.state.name,
-            "established": ps.established,
-            "verified": self._trust.is_verified(peer),
+            "members": list(self._session_members.get(sid, ())),
             "local_fingerprint": self._identity.fingerprint,
-            "peer_fingerprint": fingerprint_of(peer_key) if peer_key else None,
+            "peers": peers,
+            "all_established": all(p["established"] for p in peers),
+            "all_verified": all(p["verified"] for p in peers),
         }
 
     # ========================================================= server events ==
@@ -631,7 +679,7 @@ class ClientCore:
         mtype = msg.get("type")
         try:
             if mtype == "registered":
-                return                              # consumed by connect()
+                return
             if mtype == "session_started":
                 self._on_session_started(msg)
             elif mtype == "session_ended":
