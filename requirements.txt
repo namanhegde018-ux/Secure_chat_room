@@ -1,0 +1,4 @@
+# On Ubuntu, prefer the distro packages used in the lab:
+# sudo apt install mininet openvswitch-switch python3-os-ken python3-flask
+# This file is provided for reference; OS-Ken may be installed via apt.
+Flask>=3.1,<4

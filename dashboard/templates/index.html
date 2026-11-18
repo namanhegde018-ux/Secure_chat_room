@@ -1,0 +1,150 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Secure Group Network Monitor</title>
+  <style>
+    :root { color-scheme: dark; --bg:#101827; --panel:#1e293b; --line:#334155; --text:#f8fafc; --muted:#94a3b8; --cyan:#38bdf8; --green:#4ade80; --red:#f87171; --amber:#fbbf24; }
+    * { box-sizing:border-box; }
+    body { margin:0; padding:26px; background:var(--bg); color:var(--text); font:15px/1.45 Arial,sans-serif; }
+    header { margin-bottom:24px; }
+    h1 { color:var(--cyan); margin:0 0 5px; font-size:clamp(24px,4vw,34px); }
+    header p { margin:0; color:var(--muted); }
+    .cards { display:grid; grid-template-columns:repeat(auto-fit,minmax(165px,1fr)); gap:14px; margin-bottom:22px; }
+    .card,.section { background:var(--panel); border-radius:12px; padding:20px; }
+    .card h2 { color:var(--muted); font-size:13px; font-weight:600; margin:0 0 10px; }
+    .value { font-size:27px; font-weight:700; overflow-wrap:anywhere; }
+    .green { color:var(--green); } .red { color:var(--red); } .cyan { color:var(--cyan); } .amber { color:var(--amber); }
+    .section { margin:18px 0; }
+    .section h2 { margin:0 0 15px; color:var(--cyan); font-size:20px; }
+    .table-wrap { overflow-x:auto; }
+    table { width:100%; border-collapse:collapse; min-width:560px; }
+    th,td { text-align:left; padding:11px 10px; border-bottom:1px solid var(--line); vertical-align:top; }
+    th { color:var(--muted); font-weight:600; }
+    .status-blocked { color:var(--red); font-weight:700; }
+    .status-allowed { color:var(--green); font-weight:700; }
+    .empty { color:var(--muted); }
+    #lastUpdated { color:var(--muted); font-size:12px; margin:12px 0 0; }
+    .note { color:var(--muted); font-size:12px; margin-top:8px; }
+    @media(max-width:600px) { body { padding:14px; } .card,.section { padding:15px; } }
+  </style>
+</head>
+<body>
+<header>
+  <h1>SECURE GROUP NETWORK MONITOR</h1>
+  <p>SDN-based session access control · Mininet · Open vSwitch · OS-Ken</p>
+</header>
+
+<div class="cards">
+  <div class="card"><h2>Network status</h2><div id="networkStatus" class="value amber">CHECKING</div></div>
+  <div class="card"><h2>Active group sessions</h2><div id="activeSessions" class="value cyan">0</div></div>
+  <div class="card"><h2>Blocked events in current RAM window</h2><div id="blockedAttempts" class="value red">0</div></div>
+  <div class="card"><h2>Open vSwitch bridge</h2><div id="bridgeName" class="value cyan">s1</div></div>
+</div>
+
+<section class="section">
+  <h2>Active group sessions</h2>
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Session ID</th><th>Participants</th><th>Server relay</th><th>Started (UTC)</th><th>Status</th></tr></thead>
+      <tbody id="sessionTable"><tr><td colspan="5" class="empty">Loading sessions...</td></tr></tbody>
+    </table>
+  </div>
+</section>
+
+<section class="section">
+  <h2>Network activity</h2>
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Time</th><th>Source</th><th>Destination</th><th>Status</th><th>Details</th></tr></thead>
+      <tbody id="eventTable"><tr><td colspan="5" class="empty">Waiting for network events...</td></tr></tbody>
+    </table>
+  </div>
+  <p id="lastUpdated">Waiting for first update...</p>
+  <p class="note">Events and active-session information are held in application RAM. The blocked count reflects retained events, not unique attackers or lifetime totals.</p>
+</section>
+
+<script>
+const byId = id => document.getElementById(id);
+function cell(row, text, className) {
+  const td = document.createElement('td');
+  td.textContent = text == null ? '' : String(text);
+  if (className) td.className = className;
+  row.appendChild(td);
+}
+function formatTime(value) {
+  if (!value) return '';
+  const date = new Date(value);
+  return Number.isNaN(date.getTime()) ? value : date.toLocaleString();
+}
+async function refreshDashboard() {
+  try {
+    const [healthResponse, sessionsResponse, eventsResponse] = await Promise.all([
+      fetch('/health', {cache:'no-store'}),
+      fetch('/sessions', {cache:'no-store'}),
+      fetch('/events', {cache:'no-store'})
+    ]);
+    if (!healthResponse.ok || !sessionsResponse.ok || !eventsResponse.ok) {
+      throw new Error('One or more dashboard API requests failed');
+    }
+    const [health, sessions, events] = await Promise.all([
+      healthResponse.json(), sessionsResponse.json(), eventsResponse.json()
+    ]);
+
+    byId('networkStatus').textContent = health.status === 'healthy' ? 'ONLINE' : 'OFFLINE';
+    byId('networkStatus').className = 'value ' + (health.status === 'healthy' ? 'green' : 'red');
+    byId('bridgeName').textContent = health.bridge || 'Unknown';
+    byId('activeSessions').textContent = Object.keys(sessions).length;
+    byId('blockedAttempts').textContent = events.filter(e => e.status === 'BLOCKED').length;
+
+    const sessionBody = byId('sessionTable');
+    sessionBody.replaceChildren();
+    const entries = Object.entries(sessions);
+    if (!entries.length) {
+      const row = document.createElement('tr');
+      cell(row, 'No active group sessions', 'empty');
+      const blank = document.createElement('td'); blank.colSpan = 4; row.appendChild(blank);
+      sessionBody.appendChild(row);
+    } else {
+      for (const [id, session] of entries) {
+        const row = document.createElement('tr');
+        cell(row, id);
+        cell(row, (session.participants || []).join(', '));
+        cell(row, session.server_ip || '');
+        cell(row, formatTime(session.started_at));
+        cell(row, 'ACTIVE', 'status-allowed');
+        sessionBody.appendChild(row);
+      }
+    }
+
+    const eventBody = byId('eventTable');
+    eventBody.replaceChildren();
+    if (!events.length) {
+      const row = document.createElement('tr');
+      const td = document.createElement('td');
+      td.colSpan = 5; td.textContent = 'Waiting for network events...'; td.className = 'empty';
+      row.appendChild(td); eventBody.appendChild(row);
+    } else {
+      for (const event of [...events].reverse()) {
+        const row = document.createElement('tr');
+        cell(row, formatTime(event.time));
+        cell(row, event.source);
+        cell(row, event.destination);
+        cell(row, event.status, event.status === 'BLOCKED' ? 'status-blocked' : 'status-allowed');
+        cell(row, event.message);
+        eventBody.appendChild(row);
+      }
+    }
+    byId('lastUpdated').textContent = 'Last updated: ' + new Date().toLocaleTimeString();
+  } catch (error) {
+    byId('networkStatus').textContent = 'ERROR';
+    byId('networkStatus').className = 'value red';
+    byId('lastUpdated').textContent = 'Dashboard update failed: ' + error.message;
+  }
+}
+refreshDashboard();
+setInterval(refreshDashboard, 2000);
+</script>
+</body>
+</html>
