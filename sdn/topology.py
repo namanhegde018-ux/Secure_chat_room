@@ -1,89 +1,68 @@
-from mininet.topo import Topo
+"""Mininet topology for the database-free secure group messenger lab.
+
+Deterministic switch ports:
+  1 Alice, 2 Bob, 3 Server, 4 Mallory, 5 Charlie, 6 David
+"""
+
+from mininet.cli import CLI
+from mininet.log import setLogLevel, info
 from mininet.net import Mininet
 from mininet.node import OVSSwitch, RemoteController
-from mininet.cli import CLI
+from mininet.topo import Topo
 
 
-# Step 1: Create our network topology
-class SecureMessagingTopo(Topo):
+HOSTS = [
+    ("alice", "10.0.0.1/24", "00:00:00:00:00:01"),
+    ("bob", "10.0.0.2/24", "00:00:00:00:00:02"),
+    ("server", "10.0.0.3/24", "00:00:00:00:00:03"),
+    ("mallory", "10.0.0.4/24", "00:00:00:00:00:04"),
+    ("charlie", "10.0.0.5/24", "00:00:00:00:00:05"),
+    ("david", "10.0.0.6/24", "00:00:00:00:00:06"),
+]
 
+
+class SecureGroupTopo(Topo):
     def build(self):
-
-        # Step 2: Create four hosts
-
-        alice = self.addHost(
-            'alice',
-            ip='10.0.0.1/24'
+        switch = self.addSwitch(
+            "s1",
+            dpid="0000000000000001",
+            protocols="OpenFlow13",
+            failMode="secure",
         )
 
-        bob = self.addHost(
-            'bob',
-            ip='10.0.0.2/24'
-        )
-
-        server = self.addHost(
-            'server',
-            ip='10.0.0.3/24'
-        )
-
-        mallory = self.addHost(
-            'mallory',
-            ip='10.0.0.4/24'
-        )
-
-        # Step 3: Create Open vSwitch
-        # Standalone mode allows basic switching without a controller.
-
-        s1 = self.addSwitch(
-            's1',
-            failMode='secure',
-	    protocols='OpenFlow13'
-        )
-
-        # Step 4: Connect all hosts to the switch
-
-        self.addLink(alice, s1)
-        self.addLink(bob, s1)
-        self.addLink(server, s1)
-        self.addLink(mallory, s1)
+        # Link in this exact order. The order defines OVS port numbers.
+        for name, ip, mac in HOSTS:
+            host = self.addHost(name, ip=ip, mac=mac)
+            self.addLink(host, switch)
 
 
-# Step 5: Create the network without the default controller
+def main():
+    setLogLevel("info")
+    topo = SecureGroupTopo()
+    net = Mininet(
+        topo=topo,
+        controller=None,
+        switch=OVSSwitch,
+        autoSetMacs=False,
+        autoStaticArp=False,
+    )
 
-topo = SecureMessagingTopo()
+    net.addController(
+        "c0",
+        controller=RemoteController,
+        ip="127.0.0.1",
+        port=6633,
+    )
 
-net = Mininet(
-    topo=topo,
-    controller=None,
-    switch=OVSSwitch,
-    autoSetMacs=True
-)
+    try:
+        info("*** Starting secure group-chat topology\n")
+        net.start()
+        info("*** Host/port map: Alice=1, Bob=2, Server=3, Mallory=4, Charlie=5, David=6\n")
+        info("*** Group members: Alice, Bob, Charlie, David; Server is the relay; Mallory is monitored/blocked\n")
+        CLI(net)
+    finally:
+        net.stop()
 
-# Connect Mininet to our OS-Ken controller
 
-net.addController(
-    'c0',
-    controller=RemoteController,
-    ip='127.0.0.1',
-    port=6633
-)
-# Step 6: Start network
-
-net.start()
-
-print("\n================================")
-print(" SECURE MESSAGING NETWORK STARTED")
-print("================================")
-
-print("Alice:   10.0.0.1")
-print("Bob:     10.0.0.2")
-print("Server:  10.0.0.3")
-print("Mallory: 10.0.0.4")
-
-# Step 7: Open Mininet terminal
-
-CLI(net)
-
-# Step 8: Stop network
-
-net.stop()
+if __name__ == "__main__":
+    main()
