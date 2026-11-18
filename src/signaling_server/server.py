@@ -27,7 +27,7 @@ class SignalingServer:
     def __init__(self) -> None:
         self.registry = ClientRegistry()
         self.sessions = SessionManager()
-        self.service = SignalingService(self.registry, self.sessions)
+        self.service = SignalingService()
         self._connections: set[Connection] = set()
 
     async def handle_client(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:

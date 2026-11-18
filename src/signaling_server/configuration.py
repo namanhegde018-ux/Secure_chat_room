@@ -26,6 +26,7 @@ SWEEP_INTERVAL = 5.0                 # how often the expiry sweep runs
 # --- Per-client outbound buffering ---------------------------------------------
 OUTBOUND_QUEUE_SIZE = 256            # queued frames per client before it is treated as too slow
 FLUSH_TIMEOUT = 2.0                  # seconds allowed to flush queued frames on orderly close
+MAX_GROUP_SIZE = 20   # members per group, including the creator
 
 # --- Identity rules ------------------------------------------------------------
 MAX_CLIENT_ID_LENGTH = 32

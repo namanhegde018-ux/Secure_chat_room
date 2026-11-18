@@ -1,236 +1,222 @@
-"""
-Protocol logic: maps incoming client messages to actions and pushes events.
+"""Request handling for the signalling server.
 
-Every method here is synchronous. Handlers never await, and asyncio runs one
-task at a time, so each handler is atomic with respect to other clients and
-no locks are needed.
+SignalingService routes client requests to the SessionManager (pure logic)
+and the ClientRegistry (name -> connection mapping), then delivers the
+resulting notices to the right connections.
 """
 
 from __future__ import annotations
 
 import logging
 import re
-from typing import Any
+import time
 
-try:  # Package execution
-    from . import configuration as config
-    from .connection import Connection
-    from .session_manager import (
-        BadRequest, Conflict, NotFound, NotRegistered, SessionManager, SignalingError,
-    )
-except ImportError:  # Direct execution from this directory
-    import configuration as config
-    from connection import Connection
-    from session_manager import (
-        BadRequest, Conflict, NotFound, NotRegistered, SessionManager, SignalingError,
-    )
+import configuration as config
+from session_manager import (
+    BadRequest,
+    Conflict,
+    InvalidState,
+    NotFound,
+    NotRegistered,
+    SessionManager,
+    SignalingError,
+)
 
 log = logging.getLogger("signaling")
 
-_CLIENT_ID_RE = re.compile(r"[A-Za-z0-9_.\-]+")
-_PRE_REGISTRATION = {"register", "ping"}   # the only messages allowed before registering
+_NAME_PATTERN = r"[A-Za-z0-9_.\-]+"
+PRE_REGISTRATION = frozenset({"register", "ping"})
 
 
 class ClientRegistry:
-    """client_id -> live Connection. An entry exists only while the client is connected."""
+    """Maps client ids to connections and back. Entries exist only while connected."""
 
-    def __init__(self) -> None:
-        self._clients: dict[str, Connection] = {}
+    def __init__(self):
+        self._conns: dict[str, object] = {}
+        self._names: dict[object, str] = {}
 
-    def get(self, client_id: str) -> Connection | None:
-        return self._clients.get(client_id)
+    def get(self, name):
+        return self._conns.get(name)
 
-    def add(self, client_id: str, conn: Connection) -> None:
-        self._clients[client_id] = conn
+    def name_of(self, conn):
+        return self._names.get(conn)
 
-    def remove(self, client_id: str, conn: Connection) -> None:
-        # Only remove the entry if this connection still owns the name.
-        if self._clients.get(client_id) is conn:
-            del self._clients[client_id]
+    def add(self, name, conn):
+        self._conns[name] = conn
+        self._names[conn] = name
 
-    def __len__(self) -> int:
-        return len(self._clients)
+    def remove(self, conn):
+        """Remove the registration for conn. Returns the client id, or None."""
+        name = self._names.pop(conn, None)
+        if name is not None:
+            self._conns.pop(name, None)
+        return name
+
+    def __len__(self):
+        return len(self._conns)
 
 
-def _str_field(msg: dict[str, Any], key: str) -> str:
+def _str_field(msg, key):
     value = msg.get(key)
     if not isinstance(value, str) or not value:
-        raise BadRequest(f"field {key!r} must be a non-empty string")
+        raise BadRequest(f"'{key}' must be a non-empty string")
+    return value
+
+
+def _targets_field(msg):
+    value = msg.get("to")
+    if (
+        not isinstance(value, list)
+        or not value
+        or not all(isinstance(v, str) and v for v in value)
+    ):
+        raise BadRequest("'to' must be a non-empty list of client ids")
+    if len(set(value)) != len(value):
+        raise BadRequest("duplicate recipients in 'to'")
     return value
 
 
 class SignalingService:
-    def __init__(self, registry: ClientRegistry, sessions: SessionManager):
-        self.registry = registry
-        self.sessions = sessions
-        self._handlers = {
-            "register": self._on_register,
-            "ping": self._on_ping,
-            "invite": self._on_invite,
-            "accept": self._on_accept,
-            "reject": self._on_reject,
-            "message": self._on_message,
-            "end_session": self._on_end_session,
-        }
+    def __init__(self, *, manager=None, registry=None):
+        self.manager = manager if manager is not None else SessionManager(
+            time.monotonic,
+            max_group_size=config.MAX_GROUP_SIZE,
+            invitation_ttl=config.INVITATION_TTL,
+            session_idle_timeout=config.SESSION_IDLE_TIMEOUT,
+            finished_retention=config.FINISHED_RETENTION,
+        )
+        self.registry = registry if registry is not None else ClientRegistry()
 
-    # ------------------------------------------------------------------
-    # Entry points called by server.py
-    # ------------------------------------------------------------------
-    def handle(self, conn: Connection, msg: dict[str, Any]) -> None:
-        msg_type = msg.get("type")
+    # ----- entry points called by server.py -----
+
+    def handle(self, conn, msg):
+        msg_type = msg.get("type") if isinstance(msg, dict) else None
         try:
-            handler = self._handlers.get(msg_type) if isinstance(msg_type, str) else None
-            if handler is None:
-                raise BadRequest(f"unknown message type: {msg_type!r}")
-            if conn.client_id is None and msg_type not in _PRE_REGISTRATION:
-                raise NotRegistered("send 'register' before any other message")
-            handler(conn, msg)
+            if not isinstance(msg, dict) or not isinstance(msg_type, str):
+                raise BadRequest("message must be an object with a 'type' string")
+
+            name = self.registry.name_of(conn)
+            if name is None and msg_type not in PRE_REGISTRATION:
+                raise NotRegistered("register before sending this request")
+
+            if msg_type == "register":
+                self._register(conn, msg)
+            elif msg_type == "ping":
+                conn.send({"type": "pong"})
+            elif msg_type == "invite":
+                self._invite(name, msg)
+            elif msg_type == "accept":
+                self._deliver(
+                    self.manager.accept_invitation(name, _str_field(msg, "invitation_id"))
+                )
+            elif msg_type == "reject":
+                self._deliver(
+                    self.manager.reject_invitation(name, _str_field(msg, "invitation_id"))
+                )
+            elif msg_type == "message":
+                self._message(name, msg)
+            elif msg_type == "end_session":
+                self._deliver(
+                    self.manager.end_session(name, _str_field(msg, "session_id"), "terminated")
+                )
+            else:
+                raise BadRequest(f"unknown message type {msg_type!r}")
+
         except SignalingError as exc:
-            # Errors go back to the sender only. The connection stays open.
             conn.send({
                 "type": "error",
                 "request": msg_type,
                 "code": exc.code,
-                "message": exc.message,
+                "message": str(exc),
+            })
+        except Exception:
+            log.exception("internal error handling %r", msg_type)
+            conn.send({
+                "type": "error",
+                "request": msg_type,
+                "code": "internal",
+                "message": "internal server error",
             })
 
-    def handle_disconnect(self, conn: Connection) -> None:
-        """Clean up everything that belonged to a client that has gone away."""
-        client_id = conn.client_id
-        if client_id is None:
-            return  # never registered, nothing to clean up
+    def handle_disconnect(self, conn):
+        name = self.registry.remove(conn)
+        if name is None:
+            return
+        log.info("client %r disconnected", name)
+        notices = list(self.manager.cancel_invitations_for(name, reason="disconnected"))
+        notices += list(self.manager.end_session_of(name, "peer_disconnected"))
+        self._deliver(notices)
 
-        self.registry.remove(client_id, conn)
+    def sweep(self):
+        self._deliver(list(self.manager.expire_stale_invitations()))
+        self._deliver(list(self.manager.expire_idle_sessions()))
+        self.manager.purge_finished()
 
-        for inv in self.sessions.cancel_invitations_for(client_id):
-            other = inv.invitee if inv.inviter == client_id else inv.inviter
-            self._notify(other, {
-                "type": "invitation_cancelled",
-                "invitation_id": inv.invitation_id,
-                "reason": "peer_disconnected",
-            })
+    # ----- request handlers -----
 
-        session = self.sessions.end_session_of(client_id, reason="peer_disconnected")
-        if session is not None:
-            for member in session.members - {client_id}:
-                self._notify(member, {
-                    "type": "session_ended",
-                    "session_id": session.session_id,
-                    "reason": "peer_disconnected",
+    def _register(self, conn, msg):
+        if self.registry.name_of(conn) is not None:
+            raise InvalidState("already registered on this connection")
+        name = _str_field(msg, "client_id")
+        if len(name) > config.MAX_CLIENT_ID_LENGTH or not re.fullmatch(_NAME_PATTERN, name):
+            raise BadRequest("invalid client_id")
+        if self.registry.get(name) is not None:
+            raise Conflict(f"client id {name!r} is already in use")
+        self.registry.add(name, conn)
+        log.info("client %r registered", name)
+        conn.send({"type": "registered", "client_id": name})
+
+    def _invite(self, name, msg):
+        targets = _targets_field(msg)
+        if name in targets:
+            raise BadRequest("cannot invite yourself")
+        for target in targets:
+            if self.registry.get(target) is None:
+                raise NotFound(f"{target!r} is not online")
+
+        batch_id, invitations = self.manager.create_invitations(name, targets)
+        inviter_conn = self.registry.get(name)
+        for inv in invitations:
+            if inviter_conn is not None:
+                inviter_conn.send({
+                    "type": "invite_sent",
+                    "invitation_id": inv.invitation_id,
+                    "batch_id": batch_id,
+                    "to": inv.invitee,
+                })
+            invitee_conn = self.registry.get(inv.invitee)
+            if invitee_conn is not None:
+                invitee_conn.send({
+                    "type": "invitation",
+                    "invitation_id": inv.invitation_id,
+                    "batch_id": batch_id,
+                    "from": name,
+                    "group": inv.group,
+                    "ttl": config.INVITATION_TTL,
                 })
 
-        log.info("client %r unregistered", client_id)
-
-    def sweep(self) -> None:
-        """Expire stale invitations and sessions, and tell the affected clients."""
-        for inv in self.sessions.expire_stale_invitations():
-            event = {"type": "invitation_expired", "invitation_id": inv.invitation_id}
-            self._notify(inv.inviter, event)
-            self._notify(inv.invitee, event)
-
-        for session in self.sessions.expire_idle_sessions():
-            event = {"type": "session_expired", "session_id": session.session_id, "reason": "idle"}
-            for member in session.members:
-                self._notify(member, event)
-
-        self.sessions.purge_finished()
-
-    # ------------------------------------------------------------------
-    # Message handlers
-    # ------------------------------------------------------------------
-    def _on_register(self, conn: Connection, msg: dict[str, Any]) -> None:
-        if conn.client_id is not None:
-            raise Conflict("this connection is already registered")
-
-        client_id = _str_field(msg, "client_id")
-        if len(client_id) > config.MAX_CLIENT_ID_LENGTH or not _CLIENT_ID_RE.fullmatch(client_id):
-            raise BadRequest(
-                f"client_id must be 1-{config.MAX_CLIENT_ID_LENGTH} characters: "
-                "letters, digits, '_', '.', '-'"
-            )
-        if self.registry.get(client_id) is not None:
-            raise Conflict(f"client_id {client_id!r} is already in use")
-
-        self.registry.add(client_id, conn)
-        conn.client_id = client_id
-        conn.send({"type": "registered", "client_id": client_id})
-        log.info("client %r registered from %s", client_id, conn.peer)
-
-    def _on_ping(self, conn: Connection, msg: dict[str, Any]) -> None:
-        conn.send({"type": "pong"})
-
-    def _on_invite(self, conn: Connection, msg: dict[str, Any]) -> None:
-        invitee_id = _str_field(msg, "to")
-        if self.registry.get(invitee_id) is None:
-            raise NotFound(f"client {invitee_id!r} is not online")
-
-        invitation = self.sessions.create_invitation(conn.client_id, invitee_id)
-        self._notify(invitee_id, {
-            "type": "invitation",
-            "invitation_id": invitation.invitation_id,
-            "from": conn.client_id,
-            "ttl": config.INVITATION_TTL,
-        })
-        conn.send({
-            "type": "invite_sent",
-            "invitation_id": invitation.invitation_id,
-            "to": invitee_id,
-        })
-
-    def _on_accept(self, conn: Connection, msg: dict[str, Any]) -> None:
-        invitation_id = _str_field(msg, "invitation_id")
-        session = self.sessions.accept_invitation(conn.client_id, invitation_id)
-        event = {
-            "type": "session_started",
-            "session_id": session.session_id,
-            "members": sorted(session.members),
-        }
-        for member in session.members:
-            self._notify(member, event)
-
-    def _on_reject(self, conn: Connection, msg: dict[str, Any]) -> None:
-        invitation_id = _str_field(msg, "invitation_id")
-        invitation = self.sessions.reject_invitation(conn.client_id, invitation_id)
-        self._notify(invitation.inviter, {
-            "type": "invitation_rejected",
-            "invitation_id": invitation.invitation_id,
-            "by": conn.client_id,
-        })
-
-    def _on_message(self, conn: Connection, msg: dict[str, Any]) -> None:
+    def _message(self, name, msg):
         session_id = _str_field(msg, "session_id")
-        if "body" not in msg:
-            raise BadRequest("field 'body' is required")
-
-        # Raises Forbidden / InvalidState unless the sender is an active member.
-        recipients = self.sessions.authorize_relay(conn.client_id, session_id)
-
-        event = {
+        to = _str_field(msg, "to")
+        body = msg.get("body")
+        if not isinstance(body, dict):
+            raise BadRequest("'body' must be an object")
+        recipient = self.manager.authorize_relay(name, session_id, to)
+        conn = self.registry.get(recipient)
+        if conn is None:
+            raise NotFound(f"{recipient!r} is not online")
+        conn.send({
             "type": "message",
             "session_id": session_id,
-            "from": conn.client_id,
-            "body": msg["body"],
-        }
-        for peer in recipients:
-            self._notify(peer, event)
+            "from": name,
+            "body": body,
+        })
 
-    def _on_end_session(self, conn: Connection, msg: dict[str, Any]) -> None:
-        session_id = _str_field(msg, "session_id")
-        session = self.sessions.end_session(conn.client_id, session_id, reason="terminated")
-        event = {
-            "type": "session_ended",
-            "session_id": session.session_id,
-            "reason": "terminated",
-            "by": conn.client_id,
-        }
-        for member in session.members:
-            self._notify(member, event)
+    # ----- delivery -----
 
-    # ------------------------------------------------------------------
-    # Helpers
-    # ------------------------------------------------------------------
-    def _notify(self, client_id: str, message: dict[str, Any]) -> None:
-        """Push an event to a client if it is online. Offline clients are skipped."""
-        conn = self.registry.get(client_id)
-        if conn is not None:
-            conn.send(message)
+    def _deliver(self, notices):
+        for notice in notices:
+            conn = self.registry.get(notice.to)
+            if conn is None:
+                continue
+            conn.send({"type": notice.type, **notice.payload})
