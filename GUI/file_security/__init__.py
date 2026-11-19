@@ -1,1 +1,0 @@
-"""Chunked authenticated file transfer."""
